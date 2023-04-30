@@ -65,22 +65,6 @@ lazy_static::lazy_static! {
 pub static CLICK_TIME: AtomicI64 = AtomicI64::new(0);
 pub static MOUSE_MOVE_TIME: AtomicI64 = AtomicI64::new(0);
 
-pub const LOGIN_MSG_DESKTOP_NOT_INITED: &str = "Desktop env is not inited";
-pub const LOGIN_MSG_DESKTOP_SESSION_NOT_READY: &str = "Desktop session not ready";
-pub const LOGIN_MSG_DESKTOP_XSESSION_FAILED: &str = "Desktop xsession failed";
-pub const LOGIN_MSG_DESKTOP_SESSION_ANOTHER_USER: &str = "Desktop session another user login";
-pub const LOGIN_MSG_DESKTOP_XORG_NOT_FOUND: &str = "Desktop xorg not found";
-// ls /usr/share/xsessions/
-pub const LOGIN_MSG_DESKTOP_NO_DESKTOP: &str = "Desktop none";
-pub const LOGIN_MSG_DESKTOP_SESSION_NOT_READY_PASSWORD_EMPTY: &str =
-    "Desktop session not ready, password empty";
-pub const LOGIN_MSG_DESKTOP_SESSION_NOT_READY_PASSWORD_WRONG: &str =
-    "Desktop session not ready, password wrong";
-pub const LOGIN_MSG_PASSWORD_EMPTY: &str = "Empty Password";
-pub const LOGIN_MSG_PASSWORD_WRONG: &str = "Wrong Password";
-pub const LOGIN_MSG_NO_PASSWORD_ACCESS: &str = "No Password Access";
-pub const LOGIN_MSG_OFFLINE: &str = "Offline";
-
 #[derive(Clone, Default)]
 pub struct ConnInner {
     id: i32,
@@ -181,18 +165,23 @@ impl Subscriber for ConnInner {
 
     #[inline]
     fn send(&mut self, msg: Arc<Message>) {
-        match &msg.union {
-            Some(message::Union::VideoFrame(_)) => {
-                self.tx_video.as_mut().map(|tx| {
-                    allow_err!(tx.send((Instant::now(), msg)));
-                });
-            }
-            _ => {
-                self.tx.as_mut().map(|tx| {
-                    allow_err!(tx.send((Instant::now(), msg)));
-                });
-            }
-        }
+        // Send SwitchDisplay on the same channel as VideoFrame to avoid send order problems.
+        let tx_by_video = match &msg.union {
+            Some(message::Union::VideoFrame(_)) => true,
+            Some(message::Union::Misc(misc)) => match &misc.union {
+                Some(misc::Union::SwitchDisplay(_)) => true,
+                _ => false,
+            },
+            _ => false,
+        };
+        let tx = if tx_by_video {
+            self.tx_video.as_mut()
+        } else {
+            self.tx.as_mut()
+        };
+        tx.map(|tx| {
+            allow_err!(tx.send((Instant::now(), msg)));
+        });
     }
 }
 
@@ -579,6 +568,12 @@ impl Connection {
         } else if video_privacy_conn_id == 0 {
             let _ = privacy_mode::turn_off_privacy(0);
         }
+        #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        crate::plugin::handle_listen_event(
+            crate::plugin::EVENT_ON_CONN_CLOSE_SERVER.to_owned(),
+            conn.lr.my_id.clone(),
+        );
         video_service::notify_video_frame_fetched(id, None);
         scrap::codec::Encoder::update(id, scrap::codec::EncodingUpdate::Remove);
         video_service::VIDEO_QOS.lock().unwrap().reset();
@@ -1286,13 +1281,16 @@ impl Connection {
             // If err is LOGIN_MSG_DESKTOP_SESSION_NOT_READY, just keep this msg and go on checking password.
             #[cfg(all(target_os = "linux", feature = "linux_headless"))]
             #[cfg(not(any(feature = "flatpak", feature = "appimage")))]
-            if !desktop_err.is_empty() && desktop_err != LOGIN_MSG_DESKTOP_SESSION_NOT_READY {
+            if !desktop_err.is_empty()
+                && desktop_err != crate::client::LOGIN_MSG_DESKTOP_SESSION_NOT_READY
+            {
                 self.send_login_error(desktop_err).await;
                 return true;
             }
 
             if !hbb_common::is_ipv4_str(&lr.username) && lr.username != Config::get_id() {
-                self.send_login_error(LOGIN_MSG_OFFLINE).await;
+                self.send_login_error(crate::client::LOGIN_MSG_OFFLINE)
+                    .await;
             } else if password::approve_mode() == ApproveMode::Click
                 || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
             {
@@ -1300,7 +1298,8 @@ impl Connection {
                 if hbb_common::get_version_number(&lr.version)
                     >= hbb_common::get_version_number("1.2.0")
                 {
-                    self.send_login_error(LOGIN_MSG_NO_PASSWORD_ACCESS).await;
+                    self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS)
+                        .await;
                 }
                 return true;
             } else if password::approve_mode() == ApproveMode::Password
@@ -1339,8 +1338,10 @@ impl Connection {
                 if desktop_err.is_empty() {
                     self.try_start_cm(lr.my_id, lr.my_name, false);
                 } else {
-                    self.send_login_error(LOGIN_MSG_DESKTOP_SESSION_NOT_READY_PASSWORD_EMPTY)
-                        .await;
+                    self.send_login_error(
+                        crate::client::LOGIN_MSG_DESKTOP_SESSION_NOT_READY_PASSWORD_EMPTY,
+                    )
+                    .await;
                 }
                 #[cfg(not(all(target_os = "linux", feature = "linux_headless")))]
                 self.try_start_cm(lr.my_id, lr.my_name, false);
@@ -1387,15 +1388,19 @@ impl Connection {
                     #[cfg(all(target_os = "linux", feature = "linux_headless"))]
                     #[cfg(not(any(feature = "flatpak", feature = "appimage")))]
                     if desktop_err.is_empty() {
-                        self.send_login_error(LOGIN_MSG_PASSWORD_WRONG).await;
+                        self.send_login_error(crate::client::LOGIN_MSG_PASSWORD_WRONG)
+                            .await;
                         self.try_start_cm(lr.my_id, lr.my_name, false);
                     } else {
-                        self.send_login_error(LOGIN_MSG_DESKTOP_SESSION_NOT_READY_PASSWORD_WRONG)
-                            .await;
+                        self.send_login_error(
+                            crate::client::LOGIN_MSG_DESKTOP_SESSION_NOT_READY_PASSWORD_WRONG,
+                        )
+                        .await;
                     }
                     #[cfg(not(all(target_os = "linux", feature = "linux_headless")))]
                     {
-                        self.send_login_error(LOGIN_MSG_PASSWORD_WRONG).await;
+                        self.send_login_error(crate::client::LOGIN_MSG_PASSWORD_WRONG)
+                            .await;
                         self.try_start_cm(lr.my_id, lr.my_name, false);
                     }
                 } else {
@@ -1815,6 +1820,13 @@ impl Connection {
                                 }
                             }
                         }
+                    }
+                    #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    Some(misc::Union::PluginRequest(p)) => {
+                        let msg =
+                            crate::plugin::handle_client_event(&p.id, &self.lr.my_id, &p.content);
+                        self.send(msg).await;
                     }
                     _ => {}
                 },
@@ -2346,13 +2358,13 @@ fn try_activate_screen() {
 
 mod privacy_mode {
     use super::*;
+    #[cfg(windows)]
+    use crate::privacy_win_mag;
 
     pub(super) fn turn_off_privacy(_conn_id: i32) -> Message {
         #[cfg(windows)]
         {
-            use crate::win_privacy::*;
-
-            let res = turn_off_privacy(_conn_id, None);
+            let res = privacy_win_mag::turn_off_privacy(_conn_id, None);
             match res {
                 Ok(_) => crate::common::make_privacy_mode_msg(
                     back_notification::PrivacyModeState::PrvOffSucceeded,
@@ -2374,7 +2386,7 @@ mod privacy_mode {
     pub(super) fn turn_on_privacy(_conn_id: i32) -> ResultType<bool> {
         #[cfg(windows)]
         {
-            let plugin_exist = crate::win_privacy::turn_on_privacy(_conn_id)?;
+            let plugin_exist = privacy_win_mag::turn_on_privacy(_conn_id)?;
             Ok(plugin_exist)
         }
         #[cfg(not(windows))]
